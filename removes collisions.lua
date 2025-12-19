@@ -13,6 +13,7 @@ local flightStatusLabel
 local currentSeatedCar
 local currentSeatPart
 local flightControllers = {}
+local speedForceControllers = {}
 
 local speedSlider
 local speedSliderKnob
@@ -30,6 +31,8 @@ local FLIGHT_VERTICAL_SPEED = 80
 local speedSliderDragging = false
 local speedSliderDragInput
 local seatOriginalValues = {}
+local SPEED_FORCE_MAGNITUDE = 6000
+local panelDragLocked = false
 
 -- Collision helpers -------------------------------------------------------
 local function removeCollideParts(model)
@@ -154,6 +157,54 @@ local function removeFlightController(model)
 	flightControllers[model] = nil
 end
 
+local function ensureSpeedForce(model)
+	local primaryPart = getPrimaryPart(model)
+	if not primaryPart then
+		return nil, nil
+	end
+
+	local data = speedForceControllers[model]
+	if data and data.force and data.force.Parent then
+		return data, primaryPart
+	end
+
+	local attachment = Instance.new("Attachment")
+	attachment.Name = "SpeedBoostAttachment"
+	attachment.Parent = primaryPart
+
+	local vectorForce = Instance.new("VectorForce")
+	vectorForce.Name = "SpeedBoostForce"
+	vectorForce.Attachment0 = attachment
+	vectorForce.RelativeTo = Enum.ActuatorRelativeTo.World
+	vectorForce.ApplyAtCenterOfMass = true
+	vectorForce.Force = Vector3.zero
+	vectorForce.Parent = primaryPart
+
+	speedForceControllers[model] = {
+		attachment = attachment,
+		force = vectorForce,
+	}
+
+	return speedForceControllers[model], primaryPart
+end
+
+local function removeSpeedForce(model)
+	local data = speedForceControllers[model]
+	if not data then
+		return
+	end
+
+	if data.force then
+		data.force:Destroy()
+	end
+
+	if data.attachment then
+		data.attachment:Destroy()
+	end
+
+	speedForceControllers[model] = nil
+end
+
 local function cacheSeatDefaults(seat)
 	if not seat then
 		return nil
@@ -268,6 +319,64 @@ end
 
 RunService.Heartbeat:Connect(updateFlightMotion)
 
+local function updateGroundSpeedForce()
+	if flightEnabled then
+		if currentSeatedCar then
+			removeSpeedForce(currentSeatedCar)
+		end
+		return
+	end
+
+	if not currentSeatedCar or not currentSeatPart or not currentSeatPart:IsA("VehicleSeat") then
+		if currentSeatedCar then
+			removeSpeedForce(currentSeatedCar)
+		end
+		return
+	end
+
+	local boost = speedMultiplierValue - 1
+	if math.abs(boost) < 1e-3 then
+		removeSpeedForce(currentSeatedCar)
+		return
+	end
+
+	local controller, primaryPart = ensureSpeedForce(currentSeatedCar)
+	if not controller or not primaryPart then
+		return
+	end
+
+	local seat = currentSeatPart
+	local occupant = seat.Occupant
+	if not occupant then
+		controller.force.Force = Vector3.zero
+		return
+	end
+
+	local mass = primaryPart.AssemblyMass
+	local baseForce = mass * SPEED_FORCE_MAGNITUDE
+	local forceVector = Vector3.zero
+
+	if boost > 0 then
+		local throttle = seat.Throttle
+		if throttle ~= 0 then
+			local forwardDir = flattenVector(primaryPart.CFrame.LookVector)
+			forceVector = forwardDir * throttle * baseForce * boost
+		end
+	else
+		local velocity = primaryPart.AssemblyLinearVelocity
+		local horizontal = Vector3.new(velocity.X, 0, velocity.Z)
+		local speed = horizontal.Magnitude
+		if speed > 1 then
+			local dragDir = -horizontal.Unit
+			forceVector = dragDir * baseForce * (-boost)
+		end
+	end
+
+	controller.force.Force = forceVector
+end
+
+RunService.Heartbeat:Connect(updateGroundSpeedForce)
+
 -- UI helpers ---------------------------------------------------------------
 local function clampOffsetsToViewport(uiObject, offsetX, offsetY)
 	local camera = workspace.CurrentCamera
@@ -299,6 +408,9 @@ local function enableGuiDragging(uiObject)
 
 	uiObject.InputBegan:Connect(function(input)
 		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			if panelDragLocked then
+				return
+			end
 			dragging = true
 			dragStart = input.Position
 			startPos = uiObject.Position
@@ -433,10 +545,12 @@ local function hookSpeedSliderInput(guiObject)
 		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
 			speedSliderDragging = true
 			speedSliderDragInput = input
+			panelDragLocked = true
 			updateSpeedSliderFromPosition(input.Position)
 			input.Changed:Connect(function()
 				if input.UserInputState == Enum.UserInputState.End then
 					speedSliderDragging = false
+					panelDragLocked = false
 				end
 			end)
 		end
@@ -576,6 +690,7 @@ local function handleSeatChange(seatPart)
 
 	if currentSeatedCar and currentSeatedCar ~= carModel then
 		removeFlightController(currentSeatedCar)
+		removeSpeedForce(currentSeatedCar)
 	end
 
 	if currentSeatPart and currentSeatPart ~= seatPart then
@@ -607,6 +722,7 @@ local function setupCharacter(character)
 		if not isSeated then
 			if currentSeatedCar then
 				removeFlightController(currentSeatedCar)
+				removeSpeedForce(currentSeatedCar)
 				currentSeatedCar = nil
 			end
 			if currentSeatPart then
@@ -626,6 +742,7 @@ local function setupCharacter(character)
 	humanoid.Died:Connect(function()
 		if currentSeatedCar then
 			removeFlightController(currentSeatedCar)
+			removeSpeedForce(currentSeatedCar)
 			currentSeatedCar = nil
 		end
 		if currentSeatPart then
