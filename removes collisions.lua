@@ -11,11 +11,25 @@ local flightToggleButton
 local flightStatusLabel
 
 local currentSeatedCar
+local currentSeatPart
 local flightControllers = {}
+
+local speedSlider
+local speedSliderKnob
+local speedValueLabel
+
+local MIN_SPEED_MULTIPLIER = 0.5
+local MAX_SPEED_MULTIPLIER = 5
+local speedMultiplierValue = 1
 
 local FLIGHT_HORIZONTAL_SPEED = 120
 local FLIGHT_FORWARD_MULTIPLIER = 3
+local FLIGHT_TURN_MULTIPLIER = 0.6
 local FLIGHT_VERTICAL_SPEED = 80
+
+local speedSliderDragging = false
+local speedSliderDragInput
+local seatOriginalValues = {}
 
 -- Collision helpers -------------------------------------------------------
 local function removeCollideParts(model)
@@ -140,6 +154,55 @@ local function removeFlightController(model)
 	flightControllers[model] = nil
 end
 
+local function cacheSeatDefaults(seat)
+	if not seat then
+		return nil
+	end
+
+	local defaults = seatOriginalValues[seat]
+	if defaults then
+		return defaults
+	end
+
+	defaults = {
+		MaxSpeed = seat.MaxSpeed,
+		Torque = seat.Torque,
+		TurnSpeed = seat.TurnSpeed,
+	}
+	seatOriginalValues[seat] = defaults
+	return defaults
+end
+
+local function applySeatSpeedMultiplier(seat, multiplier)
+	if not seat or not seat:IsA("VehicleSeat") then
+		return
+	end
+
+	local defaults = cacheSeatDefaults(seat)
+	if not defaults then
+		return
+	end
+
+	seat.MaxSpeed = defaults.MaxSpeed * multiplier
+	seat.Torque = defaults.Torque * multiplier
+	seat.TurnSpeed = defaults.TurnSpeed * multiplier
+end
+
+local function restoreSeatDefaults(seat)
+	if not seat then
+		return
+	end
+
+	local defaults = seatOriginalValues[seat]
+	if not defaults then
+		return
+	end
+
+	seat.MaxSpeed = defaults.MaxSpeed
+	seat.Torque = defaults.Torque
+	seat.TurnSpeed = defaults.TurnSpeed
+end
+
 local function flattenVector(vec)
 	local flat = Vector3.new(vec.X, 0, vec.Z)
 	local magnitude = flat.Magnitude
@@ -192,7 +255,7 @@ local function updateFlightMotion()
 	end
 
 	local forwardVelocity = forwardDir * forwardInput * (FLIGHT_HORIZONTAL_SPEED * FLIGHT_FORWARD_MULTIPLIER)
-	local strafeVelocity = rightDir * strafeInput * FLIGHT_HORIZONTAL_SPEED
+	local strafeVelocity = rightDir * strafeInput * (FLIGHT_HORIZONTAL_SPEED * FLIGHT_TURN_MULTIPLIER)
 	local horizontalVelocity = forwardVelocity + strafeVelocity
 	if math.abs(forwardInput) < 1e-3 and math.abs(strafeInput) < 1e-3 then
 		horizontalVelocity = Vector3.zero
@@ -307,6 +370,91 @@ local function setFlightEnabled(enabled)
 	updateFlightStatusLabel()
 end
 
+local function updateSpeedValueLabel()
+	if not speedValueLabel then
+		return
+	end
+
+	speedValueLabel.Text = string.format("Speed Multiplier: x%.1f", speedMultiplierValue)
+end
+
+local function updateSpeedSliderVisual()
+	if not speedSlider or not speedSliderKnob then
+		return
+	end
+
+	local range = MAX_SPEED_MULTIPLIER - MIN_SPEED_MULTIPLIER
+	local normalized = range > 0 and (speedMultiplierValue - MIN_SPEED_MULTIPLIER) / range or 0
+	normalized = math.clamp(normalized, 0, 1)
+	speedSliderKnob.Position = UDim2.new(normalized, 0, 0.5, 0)
+end
+
+local function applyMultiplierToCurrentSeat()
+	if not currentSeatPart or not currentSeatPart:IsA("VehicleSeat") then
+		return
+	end
+
+	if math.abs(speedMultiplierValue - 1) < 1e-3 then
+		restoreSeatDefaults(currentSeatPart)
+	else
+		applySeatSpeedMultiplier(currentSeatPart, speedMultiplierValue)
+	end
+end
+
+local function setSpeedMultiplierValue(newValue)
+	newValue = math.clamp(newValue, MIN_SPEED_MULTIPLIER, MAX_SPEED_MULTIPLIER)
+	if math.abs(newValue - speedMultiplierValue) < 1e-3 then
+		return
+	end
+
+	speedMultiplierValue = newValue
+	applyMultiplierToCurrentSeat()
+	updateSpeedValueLabel()
+	updateSpeedSliderVisual()
+end
+
+local function updateSpeedSliderFromPosition(position)
+	if not speedSlider then
+		return
+	end
+
+	local sliderWidth = speedSlider.AbsoluteSize.X
+	if sliderWidth <= 0 then
+		return
+	end
+
+	local normalized = math.clamp((position.X - speedSlider.AbsolutePosition.X) / sliderWidth, 0, 1)
+	local value = MIN_SPEED_MULTIPLIER + normalized * (MAX_SPEED_MULTIPLIER - MIN_SPEED_MULTIPLIER)
+	setSpeedMultiplierValue(value)
+end
+
+local function hookSpeedSliderInput(guiObject)
+	guiObject.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			speedSliderDragging = true
+			speedSliderDragInput = input
+			updateSpeedSliderFromPosition(input.Position)
+			input.Changed:Connect(function()
+				if input.UserInputState == Enum.UserInputState.End then
+					speedSliderDragging = false
+				end
+			end)
+		end
+	end)
+
+	guiObject.InputChanged:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+			speedSliderDragInput = input
+		end
+	end)
+end
+
+UserInputService.InputChanged:Connect(function(input)
+	if input == speedSliderDragInput and speedSliderDragging then
+		updateSpeedSliderFromPosition(input.Position)
+	end
+end)
+
 local function createControlGui()
 	local player = Players.LocalPlayer
 	if not player then
@@ -322,7 +470,7 @@ local function createControlGui()
 	local panel = Instance.new("Frame")
 	panel.Name = "ControlPanel"
 	panel.Parent = screenGui
-	panel.Size = UDim2.new(0, 260, 0, 150)
+	panel.Size = UDim2.new(0, 260, 0, 230)
 	panel.Position = UDim2.new(0, 20, 0, 20)
 	panel.BackgroundColor3 = Color3.fromRGB(15, 15, 20)
 	panel.BackgroundTransparency = 0.2
@@ -366,6 +514,40 @@ local function createControlGui()
 	flightStatusLabel.TextXAlignment = Enum.TextXAlignment.Left
 	flightStatusLabel.TextYAlignment = Enum.TextYAlignment.Top
 
+	speedValueLabel = Instance.new("TextLabel")
+	speedValueLabel.Name = "SpeedValueLabel"
+	speedValueLabel.Parent = panel
+	speedValueLabel.BackgroundTransparency = 1
+	speedValueLabel.Size = UDim2.new(1, -20, 0, 24)
+	speedValueLabel.Position = UDim2.new(0, 10, 0, 150)
+	speedValueLabel.Font = Enum.Font.SourceSans
+	speedValueLabel.TextSize = 16
+	speedValueLabel.TextColor3 = Color3.new(1, 1, 1)
+	speedValueLabel.TextXAlignment = Enum.TextXAlignment.Left
+
+	speedSlider = Instance.new("Frame")
+	speedSlider.Name = "SpeedSlider"
+	speedSlider.Parent = panel
+	speedSlider.Size = UDim2.new(1, -40, 0, 6)
+	speedSlider.Position = UDim2.new(0, 20, 0, 190)
+	speedSlider.BackgroundColor3 = Color3.fromRGB(80, 80, 90)
+	speedSlider.BorderSizePixel = 0
+	speedSlider.Active = true
+
+	speedSliderKnob = Instance.new("Frame")
+	speedSliderKnob.Name = "SpeedSliderKnob"
+	speedSliderKnob.Parent = speedSlider
+	speedSliderKnob.Size = UDim2.new(0, 18, 0, 18)
+	speedSliderKnob.Position = UDim2.new(0, 0, 0.5, 0)
+	speedSliderKnob.AnchorPoint = Vector2.new(0.5, 0.5)
+	speedSliderKnob.BackgroundColor3 = Color3.fromRGB(255, 170, 0)
+	speedSliderKnob.BorderSizePixel = 0
+	speedSliderKnob.ZIndex = 2
+	speedSliderKnob.Active = true
+
+	hookSpeedSliderInput(speedSlider)
+	hookSpeedSliderInput(speedSliderKnob)
+
 	collisionToggleButton.MouseButton1Click:Connect(function()
 		collisionRemovalEnabled = not collisionRemovalEnabled
 		if collisionRemovalEnabled then
@@ -381,6 +563,8 @@ local function createControlGui()
 	updateCollisionToggleButton()
 	updateFlightToggleButton()
 	updateFlightStatusLabel()
+	updateSpeedValueLabel()
+	updateSpeedSliderVisual()
 end
 
 -- Character hooks ---------------------------------------------------------
@@ -392,6 +576,17 @@ local function handleSeatChange(seatPart)
 
 	if currentSeatedCar and currentSeatedCar ~= carModel then
 		removeFlightController(currentSeatedCar)
+	end
+
+	if currentSeatPart and currentSeatPart ~= seatPart then
+		restoreSeatDefaults(currentSeatPart)
+	end
+
+	currentSeatPart = seatPart
+	if currentSeatPart and currentSeatPart:IsA("VehicleSeat") then
+		applyMultiplierToCurrentSeat()
+	else
+		currentSeatPart = nil
 	end
 
 	currentSeatedCar = carModel
@@ -414,6 +609,10 @@ local function setupCharacter(character)
 				removeFlightController(currentSeatedCar)
 				currentSeatedCar = nil
 			end
+			if currentSeatPart then
+				restoreSeatDefaults(currentSeatPart)
+				currentSeatPart = nil
+			end
 			return
 		end
 
@@ -428,6 +627,10 @@ local function setupCharacter(character)
 		if currentSeatedCar then
 			removeFlightController(currentSeatedCar)
 			currentSeatedCar = nil
+		end
+		if currentSeatPart then
+			restoreSeatDefaults(currentSeatPart)
+			currentSeatPart = nil
 		end
 	end)
 end
