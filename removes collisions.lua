@@ -14,6 +14,7 @@ local currentSeatedCar
 local flightControllers = {}
 
 local FLIGHT_HORIZONTAL_SPEED = 120
+local FLIGHT_FORWARD_MULTIPLIER = 3
 local FLIGHT_VERTICAL_SPEED = 80
 
 -- Collision helpers -------------------------------------------------------
@@ -139,6 +140,15 @@ local function removeFlightController(model)
 	flightControllers[model] = nil
 end
 
+local function flattenVector(vec)
+	local flat = Vector3.new(vec.X, 0, vec.Z)
+	local magnitude = flat.Magnitude
+	if magnitude < 1e-4 then
+		return Vector3.zero
+	end
+	return flat / magnitude
+end
+
 local function updateFlightMotion()
 	if not flightEnabled then
 		return
@@ -154,25 +164,23 @@ local function updateFlightMotion()
 		return
 	end
 
-	local forward = primaryPart.CFrame.LookVector
-	local right = primaryPart.CFrame.RightVector
-	local moveDir = Vector3.zero
+	local forwardDir = flattenVector(primaryPart.CFrame.LookVector)
+	local rightDir = flattenVector(primaryPart.CFrame.RightVector)
 
+	local forwardInput = 0
 	if UserInputService:IsKeyDown(Enum.KeyCode.W) then
-		moveDir += forward
+		forwardInput += 1
 	end
 	if UserInputService:IsKeyDown(Enum.KeyCode.S) then
-		moveDir -= forward
-	end
-	if UserInputService:IsKeyDown(Enum.KeyCode.A) then
-		moveDir -= right
-	end
-	if UserInputService:IsKeyDown(Enum.KeyCode.D) then
-		moveDir += right
+		forwardInput -= 1
 	end
 
-	if moveDir.Magnitude > 0 then
-		moveDir = moveDir.Unit
+	local strafeInput = 0
+	if UserInputService:IsKeyDown(Enum.KeyCode.D) then
+		strafeInput += 1
+	end
+	if UserInputService:IsKeyDown(Enum.KeyCode.A) then
+		strafeInput -= 1
 	end
 
 	local verticalInput = 0
@@ -183,7 +191,12 @@ local function updateFlightMotion()
 		verticalInput -= 1
 	end
 
-	local horizontalVelocity = moveDir * FLIGHT_HORIZONTAL_SPEED
+	local forwardVelocity = forwardDir * forwardInput * (FLIGHT_HORIZONTAL_SPEED * FLIGHT_FORWARD_MULTIPLIER)
+	local strafeVelocity = rightDir * strafeInput * FLIGHT_HORIZONTAL_SPEED
+	local horizontalVelocity = forwardVelocity + strafeVelocity
+	if math.abs(forwardInput) < 1e-3 and math.abs(strafeInput) < 1e-3 then
+		horizontalVelocity = Vector3.zero
+	end
 	local verticalVelocity = Vector3.new(0, verticalInput * FLIGHT_VERTICAL_SPEED, 0)
 
 	controller.linearVelocity.VectorVelocity = horizontalVelocity + verticalVelocity
