@@ -1,11 +1,22 @@
 local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
 
 local collisionRemovalEnabled = true
-local carAddedConnection
-local toggleButton
+local flightEnabled = false
 
--- Function to remove Collide parts from a model
+local carAddedConnection
+local collisionToggleButton
+local flightToggleButton
+local flightStatusLabel
+
+local currentSeatedCar
+local flightControllers = {}
+
+local FLIGHT_HORIZONTAL_SPEED = 120
+local FLIGHT_VERTICAL_SPEED = 80
+
+-- Collision helpers -------------------------------------------------------
 local function removeCollideParts(model)
 	if not collisionRemovalEnabled then
 		return
@@ -20,7 +31,6 @@ local function removeCollideParts(model)
 	end
 end
 
--- Function to process all existing cars
 local function processExistingCars()
 	if not collisionRemovalEnabled then
 		return
@@ -30,32 +40,34 @@ local function processExistingCars()
 	if not aiTraffic then
 		return
 	end
-	
+
 	local carFolder = aiTraffic:FindFirstChild("Car")
 	if not carFolder then
 		return
 	end
-	
+
 	for _, car in ipairs(carFolder:GetChildren()) do
 		removeCollideParts(car)
 	end
 end
 
--- Function to monitor for new cars being added
 local function monitorNewCars()
 	local aiTraffic = workspace:FindFirstChild("AITraffic")
-	if not aiTraffic then return end
-	
+	if not aiTraffic then
+		return
+	end
+
 	local carFolder = aiTraffic:FindFirstChild("Car")
-	if not carFolder then return end
+	if not carFolder then
+		return
+	end
 
 	if carAddedConnection then
 		carAddedConnection:Disconnect()
 	end
-	
-	-- Listen for new cars being added
+
 	carAddedConnection = carFolder.ChildAdded:Connect(function(car)
-		wait(0.1) -- Small delay to ensure the model is fully loaded
+		wait(0.1)
 		if not collisionRemovalEnabled then
 			return
 		end
@@ -63,22 +75,139 @@ local function monitorNewCars()
 	end)
 end
 
+-- Flight helpers ----------------------------------------------------------
+local function getPrimaryPart(model)
+	if model.PrimaryPart then
+		return model.PrimaryPart
+	end
+
+	for _, descendant in ipairs(model:GetDescendants()) do
+		if descendant:IsA("BasePart") then
+			model.PrimaryPart = descendant
+			return descendant
+		end
+	end
+
+	return nil
+end
+
+local function ensureFlightController(model)
+	local primaryPart = getPrimaryPart(model)
+	if not primaryPart then
+		return nil, nil
+	end
+
+	local data = flightControllers[model]
+	if data and data.linearVelocity and data.linearVelocity.Parent then
+		return data, primaryPart
+	end
+
+	local attachment = Instance.new("Attachment")
+	attachment.Name = "FlightAttachment"
+	attachment.Parent = primaryPart
+
+	local linearVelocity = Instance.new("LinearVelocity")
+	linearVelocity.Name = "FlightLinearVelocity"
+	linearVelocity.Attachment0 = attachment
+	linearVelocity.RelativeTo = Enum.ActuatorRelativeTo.World
+	linearVelocity.MaxForce = math.huge
+	linearVelocity.VectorVelocity = Vector3.zero
+	linearVelocity.Parent = primaryPart
+
+	flightControllers[model] = {
+		attachment = attachment,
+		linearVelocity = linearVelocity,
+	}
+
+	return flightControllers[model], primaryPart
+end
+
+local function removeFlightController(model)
+	local data = flightControllers[model]
+	if not data then
+		return
+	end
+
+	if data.linearVelocity then
+		data.linearVelocity:Destroy()
+	end
+
+	if data.attachment then
+		data.attachment:Destroy()
+	end
+
+	flightControllers[model] = nil
+end
+
+local function updateFlightMotion()
+	if not flightEnabled then
+		return
+	end
+
+	local car = currentSeatedCar
+	if not car then
+		return
+	end
+
+	local controller, primaryPart = ensureFlightController(car)
+	if not controller or not primaryPart then
+		return
+	end
+
+	local forward = primaryPart.CFrame.LookVector
+	local right = primaryPart.CFrame.RightVector
+	local moveDir = Vector3.zero
+
+	if UserInputService:IsKeyDown(Enum.KeyCode.W) then
+		moveDir += forward
+	end
+	if UserInputService:IsKeyDown(Enum.KeyCode.S) then
+		moveDir -= forward
+	end
+	if UserInputService:IsKeyDown(Enum.KeyCode.A) then
+		moveDir -= right
+	end
+	if UserInputService:IsKeyDown(Enum.KeyCode.D) then
+		moveDir += right
+	end
+
+	if moveDir.Magnitude > 0 then
+		moveDir = moveDir.Unit
+	end
+
+	local verticalInput = 0
+	if UserInputService:IsKeyDown(Enum.KeyCode.E) then
+		verticalInput += 1
+	end
+	if UserInputService:IsKeyDown(Enum.KeyCode.Q) or UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) then
+		verticalInput -= 1
+	end
+
+	local horizontalVelocity = moveDir * FLIGHT_HORIZONTAL_SPEED
+	local verticalVelocity = Vector3.new(0, verticalInput * FLIGHT_VERTICAL_SPEED, 0)
+
+	controller.linearVelocity.VectorVelocity = horizontalVelocity + verticalVelocity
+	primaryPart.AssemblyAngularVelocity = Vector3.zero
+end
+
+RunService.Heartbeat:Connect(updateFlightMotion)
+
 -- UI helpers ---------------------------------------------------------------
-local function clampOffsetsToViewport(button, offsetX, offsetY)
+local function clampOffsetsToViewport(uiObject, offsetX, offsetY)
 	local camera = workspace.CurrentCamera
 	if not camera then
 		return offsetX, offsetY
 	end
 
 	local viewportSize = camera.ViewportSize
-	local buttonSize = button.AbsoluteSize
-	local maxX = viewportSize.X - buttonSize.X
-	local maxY = viewportSize.Y - buttonSize.Y
+	local objectSize = uiObject.AbsoluteSize
+	local maxX = viewportSize.X - objectSize.X
+	local maxY = viewportSize.Y - objectSize.Y
 
 	return math.clamp(offsetX, 0, math.max(maxX, 0)), math.clamp(offsetY, 0, math.max(maxY, 0))
 end
 
-local function enableButtonDragging(button)
+local function enableGuiDragging(uiObject)
 	local dragging = false
 	local dragInput
 	local dragStart
@@ -88,15 +217,15 @@ local function enableButtonDragging(button)
 		local delta = input.Position - dragStart
 		local newOffsetX = startPos.X.Offset + delta.X
 		local newOffsetY = startPos.Y.Offset + delta.Y
-		local clampedX, clampedY = clampOffsetsToViewport(button, newOffsetX, newOffsetY)
-		button.Position = UDim2.new(startPos.X.Scale, clampedX, startPos.Y.Scale, clampedY)
+		local clampedX, clampedY = clampOffsetsToViewport(uiObject, newOffsetX, newOffsetY)
+		uiObject.Position = UDim2.new(startPos.X.Scale, clampedX, startPos.Y.Scale, clampedY)
 	end
 
-	button.InputBegan:Connect(function(input)
+	uiObject.InputBegan:Connect(function(input)
 		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
 			dragging = true
 			dragStart = input.Position
-			startPos = button.Position
+			startPos = uiObject.Position
 			input.Changed:Connect(function()
 				if input.UserInputState == Enum.UserInputState.End then
 					dragging = false
@@ -105,7 +234,7 @@ local function enableButtonDragging(button)
 		end
 	end)
 
-	button.InputChanged:Connect(function(input)
+	uiObject.InputChanged:Connect(function(input)
 		if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
 			dragInput = input
 		end
@@ -118,16 +247,54 @@ local function enableButtonDragging(button)
 	end)
 end
 
-local function updateToggleButton()
-	if not toggleButton then
+local function updateCollisionToggleButton()
+	if not collisionToggleButton then
 		return
 	end
 
-	toggleButton.Text = collisionRemovalEnabled and "AI Traffic Collisions: ON" or "AI Traffic Collisions: OFF"
-	toggleButton.BackgroundColor3 = collisionRemovalEnabled and Color3.fromRGB(0, 170, 0) or Color3.fromRGB(170, 0, 0)
+	collisionToggleButton.Text = collisionRemovalEnabled and "AI Traffic Collisions: ON" or "AI Traffic Collisions: OFF"
+	collisionToggleButton.BackgroundColor3 = collisionRemovalEnabled and Color3.fromRGB(0, 170, 0) or Color3.fromRGB(170, 0, 0)
 end
 
-local function createToggleGui()
+local function updateFlightToggleButton()
+	if not flightToggleButton then
+		return
+	end
+
+	flightToggleButton.Text = flightEnabled and "Flight Mode: ON" or "Flight Mode: OFF"
+	flightToggleButton.BackgroundColor3 = flightEnabled and Color3.fromRGB(0, 120, 255) or Color3.fromRGB(60, 60, 60)
+end
+
+local function updateFlightStatusLabel()
+	if not flightStatusLabel then
+		return
+	end
+
+	if flightEnabled then
+		flightStatusLabel.Text = "Flight Controls: WASD move, E ascend, Q/LeftCtrl descend"
+	else
+		flightStatusLabel.Text = "Flight Controls disabled"
+	end
+end
+
+local function setFlightEnabled(enabled)
+	if flightEnabled == enabled then
+		return
+	end
+
+	flightEnabled = enabled
+
+	if not flightEnabled and currentSeatedCar then
+		removeFlightController(currentSeatedCar)
+	elseif flightEnabled and currentSeatedCar then
+		ensureFlightController(currentSeatedCar)
+	end
+
+	updateFlightToggleButton()
+	updateFlightStatusLabel()
+end
+
+local function createControlGui()
 	local player = Players.LocalPlayer
 	if not player then
 		return
@@ -135,36 +302,132 @@ local function createToggleGui()
 
 	local playerGui = player:WaitForChild("PlayerGui")
 	local screenGui = Instance.new("ScreenGui")
-	screenGui.Name = "CollisionToggleGui"
+	screenGui.Name = "CollisionFlightGui"
 	screenGui.ResetOnSpawn = false
 	screenGui.Parent = playerGui
 
-	toggleButton = Instance.new("TextButton")
-	toggleButton.Name = "CollisionToggleButton"
-	toggleButton.Parent = screenGui
-	toggleButton.Size = UDim2.new(0, 220, 0, 40)
-	toggleButton.Position = UDim2.new(0, 20, 0, 20)
-	toggleButton.Font = Enum.Font.SourceSansBold
-	toggleButton.TextSize = 18
-	toggleButton.TextColor3 = Color3.new(1, 1, 1)
-	toggleButton.AutoButtonColor = false
-	toggleButton.BorderSizePixel = 0
+	local panel = Instance.new("Frame")
+	panel.Name = "ControlPanel"
+	panel.Parent = screenGui
+	panel.Size = UDim2.new(0, 260, 0, 150)
+	panel.Position = UDim2.new(0, 20, 0, 20)
+	panel.BackgroundColor3 = Color3.fromRGB(15, 15, 20)
+	panel.BackgroundTransparency = 0.2
+	panel.BorderSizePixel = 0
+	panel.Active = true
 
-	enableButtonDragging(toggleButton)
+	enableGuiDragging(panel)
 
-	-- Toggling simply flips the enabled flag and optionally reprocesses cars
-	toggleButton.MouseButton1Click:Connect(function()
+	collisionToggleButton = Instance.new("TextButton")
+	collisionToggleButton.Name = "CollisionToggleButton"
+	collisionToggleButton.Parent = panel
+	collisionToggleButton.Size = UDim2.new(1, -20, 0, 40)
+	collisionToggleButton.Position = UDim2.new(0, 10, 0, 10)
+	collisionToggleButton.Font = Enum.Font.SourceSansBold
+	collisionToggleButton.TextSize = 18
+	collisionToggleButton.TextColor3 = Color3.new(1, 1, 1)
+	collisionToggleButton.AutoButtonColor = false
+	collisionToggleButton.BorderSizePixel = 0
+
+	flightToggleButton = Instance.new("TextButton")
+	flightToggleButton.Name = "FlightToggleButton"
+	flightToggleButton.Parent = panel
+	flightToggleButton.Size = UDim2.new(1, -20, 0, 40)
+	flightToggleButton.Position = UDim2.new(0, 10, 0, 60)
+	flightToggleButton.Font = Enum.Font.SourceSansBold
+	flightToggleButton.TextSize = 18
+	flightToggleButton.TextColor3 = Color3.new(1, 1, 1)
+	flightToggleButton.AutoButtonColor = false
+	flightToggleButton.BorderSizePixel = 0
+
+	flightStatusLabel = Instance.new("TextLabel")
+	flightStatusLabel.Name = "FlightStatusLabel"
+	flightStatusLabel.Parent = panel
+	flightStatusLabel.BackgroundTransparency = 1
+	flightStatusLabel.Size = UDim2.new(1, -20, 0, 30)
+	flightStatusLabel.Position = UDim2.new(0, 10, 0, 110)
+	flightStatusLabel.Font = Enum.Font.SourceSans
+	flightStatusLabel.TextSize = 16
+	flightStatusLabel.TextColor3 = Color3.new(1, 1, 1)
+	flightStatusLabel.TextWrapped = true
+	flightStatusLabel.TextXAlignment = Enum.TextXAlignment.Left
+	flightStatusLabel.TextYAlignment = Enum.TextYAlignment.Top
+
+	collisionToggleButton.MouseButton1Click:Connect(function()
 		collisionRemovalEnabled = not collisionRemovalEnabled
 		if collisionRemovalEnabled then
 			processExistingCars()
 		end
-		updateToggleButton()
+		updateCollisionToggleButton()
 	end)
 
-	updateToggleButton()
+	flightToggleButton.MouseButton1Click:Connect(function()
+		setFlightEnabled(not flightEnabled)
+	end)
+
+	updateCollisionToggleButton()
+	updateFlightToggleButton()
+	updateFlightStatusLabel()
 end
 
--- Run the script
+-- Character hooks ---------------------------------------------------------
+local function handleSeatChange(seatPart)
+	local carModel = seatPart and seatPart:FindFirstAncestorOfClass("Model")
+	if not carModel then
+		return
+	end
+
+	if currentSeatedCar and currentSeatedCar ~= carModel then
+		removeFlightController(currentSeatedCar)
+	end
+
+	currentSeatedCar = carModel
+	if flightEnabled then
+		ensureFlightController(carModel)
+	else
+		removeFlightController(carModel)
+	end
+end
+
+local function setupCharacter(character)
+	local humanoid = character:FindFirstChildOfClass("Humanoid") or character:WaitForChild("Humanoid", 5)
+	if not humanoid then
+		return
+	end
+
+	humanoid.Seated:Connect(function(isSeated, seatPart)
+		if not isSeated then
+			if currentSeatedCar then
+				removeFlightController(currentSeatedCar)
+				currentSeatedCar = nil
+			end
+			return
+		end
+
+		if not seatPart then
+			return
+		end
+
+		handleSeatChange(seatPart)
+	end)
+
+	humanoid.Died:Connect(function()
+		if currentSeatedCar then
+			removeFlightController(currentSeatedCar)
+			currentSeatedCar = nil
+		end
+	end)
+end
+
+local localPlayer = Players.LocalPlayer
+if localPlayer then
+	if localPlayer.Character then
+		task.defer(setupCharacter, localPlayer.Character)
+	end
+	localPlayer.CharacterAdded:Connect(setupCharacter)
+end
+
+-- Run the script ----------------------------------------------------------
 processExistingCars()
 monitorNewCars()
-createToggleGui()
+createControlGui()
